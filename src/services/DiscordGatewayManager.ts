@@ -64,6 +64,7 @@ export class DiscordGatewayManager {
     const gateway = new DiscordGatewayService({ ...input, deliver: async () => undefined });
     try {
       await gateway.start();
+      await gateway.verifyChannelAccess();
       return { success: true, status: gateway.getStatus() };
     } finally {
       await gateway.stop();

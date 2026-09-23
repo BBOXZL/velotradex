@@ -115,4 +115,25 @@ describe('Discord realtime ingestion', () => {
     const service = serviceModule.createDiscordGatewayFromConfig(jest.fn().mockResolvedValue(undefined));
     expect(service).not.toBeNull();
   });
+
+  test('tests personal-token channel access through Discord REST after Gateway READY', async () => {
+    const restGet = jest.fn().mockResolvedValue([]);
+    const connection = {
+      rest: { get: restGet },
+      connect: jest.fn().mockResolvedValue(undefined),
+      close: jest.fn().mockResolvedValue(undefined),
+    };
+    const service = new DiscordGatewayService({
+      token: 'personal-token',
+      tokenMode: 'user',
+      channelIds: ['200', '201'],
+      deliver: jest.fn().mockResolvedValue(undefined),
+      userGatewayFactory: () => connection,
+    });
+    await service.start();
+    await service.verifyChannelAccess();
+    expect(restGet).toHaveBeenNthCalledWith(1, '/channels/200/messages?limit=1');
+    expect(restGet).toHaveBeenNthCalledWith(2, '/channels/201/messages?limit=1');
+    await service.stop();
+  });
 });
