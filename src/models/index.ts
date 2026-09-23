@@ -26,6 +26,7 @@ import CfdLegGroup from './CfdLegGroup';
 import CfdLeg from './CfdLeg';
 import ExchangeConnectionLog from './ExchangeConnectionLog';
 import BacktestRun from './BacktestRun';
+import DiscordConfig from './DiscordConfig';
 
 // Define associations
 Strategy.hasMany(Order, { foreignKey: 'strategyId', as: 'Orders' });
@@ -78,6 +79,7 @@ export {
   CfdLeg,
   ExchangeConnectionLog,
   BacktestRun,
+  DiscordConfig,
 };
 
 export default sequelize;

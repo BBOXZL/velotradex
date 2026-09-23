@@ -6,7 +6,7 @@ import marketService from './MarketService';
 import { AsyncLocalStorage } from 'async_hooks';
 import { normalizeResult } from './AIParserResponseNormalizer';
 import { buildRetryAnalyzeOptions } from './AIParserRetryOptions';
-import { isAliyunCompatibleBaseUrl, normalizeProviderExtraPayload, parseExtraPayloadValue, resolveRequestTimeoutMs } from './AIParserProviderConfig';
+import { isAliyunCompatibleBaseUrl, normalizeAIBaseUrl, normalizeProviderExtraPayload, parseExtraPayloadValue, resolveRequestTimeoutMs } from './AIParserProviderConfig';
 import { buildPrompt, escapeXML } from './AIParserPromptBuilder';
 
 export type AIAction = 'open' | 'close' | 'update' | 'cancel' | 'ignore';
@@ -57,6 +57,26 @@ export interface AIRetrySourceLog {
 type AnalyzeRawResult = { content: string; usage: any; raw: any; logId?: number };
 type AIRouteContext = { routeIds?: number[]; routeNames?: string[] };
 
+function extractAIResponseContent(data: any): string {
+    const choice = data?.choices?.[0];
+    const content = choice?.message?.content ?? choice?.text ?? data?.output_text;
+    if (typeof content === 'string') return content.trim();
+    if (Array.isArray(content)) {
+        return content
+            .map((part: any) => typeof part === 'string' ? part : part?.text ?? part?.content ?? '')
+            .filter(Boolean)
+            .join('')
+            .trim();
+    }
+    const output = Array.isArray(data?.output) ? data.output : [];
+    return output
+        .flatMap((item: any) => Array.isArray(item?.content) ? item.content : [])
+        .map((part: any) => part?.text ?? part?.content ?? '')
+        .filter(Boolean)
+        .join('')
+        .trim();
+}
+
 export { buildRetryAnalyzeOptions };
 
 function buildRouteLogFields(options: Pick<AIAnalysisOptions, 'routeIds' | 'routeNames'> | AIRouteContext) {
@@ -86,7 +106,7 @@ class AIParserService {
             if (config) {
                 this.config = config;
 
-                const baseURL = config.baseUrl || 'https://api.openai.com/v1';
+                const baseURL = normalizeAIBaseUrl(config.baseUrl);
                 this.client = axios.create({
                     baseURL: baseURL,
                     headers: {
@@ -210,8 +230,7 @@ class AIParserService {
                 timeout: resolveRequestTimeoutMs(options.timeout, this.config?.requestTimeoutMs)
             });
 
-            const choice = response.data.choices?.[0];
-            finalResponseContent = choice?.message?.content;
+            finalResponseContent = extractAIResponseContent(response.data);
 
             if (!finalResponseContent) throw new Error('Empty response from AI (analyzeRaw)');
 
@@ -388,7 +407,7 @@ class AIParserService {
 
         // If config provided, create a temporary client
         if (config && config.apiKey) {
-            const baseURL = config.baseUrl || 'https://api.openai.com/v1';
+            const baseURL = normalizeAIBaseUrl(config.baseUrl);
             client = axios.create({
                 baseURL: baseURL,
                 headers: {
@@ -412,7 +431,7 @@ class AIParserService {
 
     public async testConfig(config: any): Promise<{ success: boolean, message: string }> {
         try {
-            const baseURL = config.baseUrl || 'https://api.openai.com/v1';
+            const baseURL = normalizeAIBaseUrl(config.baseUrl);
             const client = axios.create({
                 baseURL: baseURL,
                 headers: {
@@ -429,7 +448,7 @@ class AIParserService {
                 ...normalizeProviderExtraPayload(parseExtraPayloadValue(config.extraPayload), config.baseUrl)
             });
 
-            const content = response.data?.choices?.[0]?.message?.content;
+            const content = extractAIResponseContent(response.data);
             if (!content || !String(content).trim()) {
                 return { success: false, message: '模型调用成功但未返回内容' };
             }

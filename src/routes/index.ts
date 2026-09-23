@@ -30,6 +30,7 @@ import aiConfigRoutes from './aiConfig';
 import virtualExchangeRoutes from './virtualExchange';
 import apiCredentialRoutes from './apiCredentials';
 import tradeRoutes from './trade';
+import discordConfigRoutes from './discordConfig';
 // 历史回测功能暂时不可用，恢复时取消注释
 // import backtestRoutes from './backtest';
 import healthRoutes from './health';
@@ -156,6 +157,7 @@ router.use('/api/trades', tradeRoutes.routes(), tradeRoutes.allowedMethods());
 // 历史回测功能暂时不可用，恢复时取消注释
 // router.use('/api/backtest', backtestRoutes.routes(), backtestRoutes.allowedMethods());
 router.use('/api/api-credentials', apiCredentialRoutes.routes(), apiCredentialRoutes.allowedMethods());
+router.use('/api/discord-config', discordConfigRoutes.routes(), discordConfigRoutes.allowedMethods());
 
 router.post('/api/auth/change-password', async (ctx) => {
   const clientIp = ctx.ip || 'unknown';

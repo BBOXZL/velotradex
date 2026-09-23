@@ -10,6 +10,7 @@ import router from './routes';
 import { initializeServices } from './serviceStartup';
 import { handleChannelMessage } from './channelMessageHandler';
 import systemStatusService from './services/SystemStatusService';
+import { discordGatewayManager } from './services/DiscordGatewayManager';
 
 const app = new Koa();
 app.proxy = true;
@@ -92,8 +93,16 @@ const start = async () => {
 
   // 后台初始化：失败不退出进程，仅记录日志；SystemStatusService 会暴露各组件状态供前端展示。
   void initializeServices()
-    .then(() => {
+    .then(async () => {
       logger.info('Background service initialization completed');
+      // Await downstream processing instead of fire-and-forget Pub/Sub so a
+      // follow-up cannot overtake the opening signal while AI is still running.
+      if (!config.backtest.child) {
+        await discordGatewayManager.initialize(handleChannelMessage);
+        const stopDiscord = () => { void discordGatewayManager.stop(); };
+        process.once('SIGTERM', stopDiscord);
+        process.once('SIGINT', stopDiscord);
+      }
       // 初始化完成后立即刷新一次状态，避免首页在启动初期显示不准确的组件状态
       void systemStatusService.refreshNow();
     })

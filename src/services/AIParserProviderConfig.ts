@@ -1,5 +1,15 @@
 import logger, { formatError } from '../utils/logger';
 
+export function normalizeAIBaseUrl(input: string | null | undefined): string {
+    const url = new URL(input?.trim() || 'https://api.openai.com/v1');
+    if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+        throw new Error('AI base URL must be an HTTP(S) API URL without credentials, query or fragment');
+    }
+    url.pathname = url.pathname.replace(/\/+$/, '').replace(/\/chat\/completions$/, '');
+    if (!url.pathname || url.pathname === '/') url.pathname = '/v1';
+    return url.toString().replace(/\/$/, '');
+}
+
 export function isAliyunCompatibleBaseUrl(baseUrl: string | null | undefined): boolean {
     const normalized = String(baseUrl ?? '').toLowerCase();
     return normalized.includes('dashscope.aliyuncs.com') || normalized.includes('aliyuncs.com/compatible-mode');

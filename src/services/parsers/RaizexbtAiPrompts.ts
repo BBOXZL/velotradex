@@ -163,9 +163,14 @@ export function parseResponseContent(content: string, usage: any, logPrefix: str
 
     try {
         // Handle potential markdown code block wrapping
-        let jsonStr = content.trim();
-        if (jsonStr.startsWith('```')) {
-            jsonStr = jsonStr.replace(/^```(?:json)?\s*/, '').replace(/```\s*$/, '');
+        let jsonStr = content.trim()
+            .replace(/^```(?:json)?\s*/i, '')
+            .replace(/\s*```\s*$/i, '')
+            .trim();
+        const objectStart = jsonStr.indexOf('{');
+        const objectEnd = jsonStr.lastIndexOf('}');
+        if (objectStart >= 0 && objectEnd > objectStart) {
+            jsonStr = jsonStr.slice(objectStart, objectEnd + 1);
         }
 
         const result = JSON.parse(jsonStr) as LLMResult;
@@ -178,6 +183,7 @@ export function parseResponseContent(content: string, usage: any, logPrefix: str
 
         // Normalize action
         const validActions: LLMAction[] = ['open', 'close', 'update', 'cancel', 'ignore'];
+        result.action = String(result.action).trim().toLowerCase() as LLMAction;
         if (!validActions.includes(result.action)) {
             logger.warn(`${logPrefix} Invalid action from LLM`, { action: result.action });
             return null;
@@ -190,7 +196,7 @@ export function parseResponseContent(content: string, usage: any, logPrefix: str
 
         // Normalize side
         if (result.side) {
-            const s = String(result.side).toLowerCase();
+            const s = String(result.side).trim().toLowerCase();
             if (s === 'buy' || s === 'long') result.side = 'buy';
             else if (s === 'sell' || s === 'short') result.side = 'sell';
         }

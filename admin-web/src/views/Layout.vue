@@ -101,6 +101,10 @@
                 <el-icon><IconBell /></el-icon>
                 <template #title>Webhook 通知</template>
             </el-menu-item>
+            <el-menu-item index="/discord-config" v-if="authStore.user?.role === 'admin'">
+                <el-icon><IconBrandDiscord /></el-icon>
+                <template #title>Discord 接收</template>
+            </el-menu-item>
             <el-menu-item index="/logs">
                 <el-icon><IconFileText /></el-icon>
                 <template #title>系统日志</template>
@@ -192,6 +196,7 @@ import {
   IconFileText,
   IconRefresh,
   IconKey,
+  IconBrandDiscord,
   // IconHistory // 历史回测功能暂时不可用
 } from '@tabler/icons-vue'
 import request from '../utils/request'
@@ -229,6 +234,7 @@ const currentRouteName = computed(() => {
     '/api-credentials': 'API 凭证',
     '/audit-logs': '操作审计',
     '/webhooks': 'Webhook 通知',
+    '/discord-config': 'Discord 接收',
     '/ai-config': 'AI 解析',
     '/logs': '系统日志',
     '/backup': '备份恢复'
