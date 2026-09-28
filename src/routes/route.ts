@@ -33,6 +33,11 @@ function validateRiskSettingsFields(riskSettings: any): string | null {
         return 'entrySelection 必须为 "all"（全部入场）或 "nearest_sl"（仅最靠近止损的入场点）';
     }
 
+    const multiLegSizing = riskSettings.multiLegSizing;
+    if (multiLegSizing !== undefined && multiLegSizing !== null && multiLegSizing !== '' && multiLegSizing !== 'split' && multiLegSizing !== 'full') {
+        return 'multiLegSizing 必须为 "split"（均分风险，默认）或 "full"（每腿全额，双腿全中约 2 倍风险）';
+    }
+
     return null;
 }
 

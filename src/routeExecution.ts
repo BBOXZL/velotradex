@@ -9,6 +9,7 @@ import config from './config';
 import { AIAnalysisResult } from './services/AIParserService';
 import { applyAIResultToParsedStrategy, normalizeRouteSymbol } from './services/RouteParsedStrategy';
 import { applyEntrySelection } from './services/EntrySelection';
+import { applyMultiLegSizing, normalizeMultiLegSizing } from './services/MultiLegSizing';
 import { createStageDebug } from './utils/debug';
 import { nowOrSim } from './backtest/Clock';
 import { MIN_AI_CONFIDENCE, routeDisplayName, routeLogMessage, summarizeParsedStrategy, summarizeRoute } from './messageHelpers';
@@ -291,6 +292,26 @@ export async function executeRouteForStrategy(ctx: RouteExecutionContext) {
             exchangeInstanceId,
             routeParsed: summarizeParsedStrategy(routeParsed),
           });
+        }
+
+        // ── 多腿风险分摊（riskConfig.multiLegSizing, S4）──
+        // 先后关系：entrySelection 先过滤（nearest_sl 跳过非最近腿），
+        // multiLegSizing 只作用于剩余腿的分摊。默认 'split' 保持现状（weight=1/N）；
+        // 'full' 时多腿每腿 weight=1 全额（双腿全中约 2 倍风险）。
+        // 注意：processStrategiesForParser 里 parsed 是逐条处理的，
+        // 这里只能看到单条；full 的 weight=1 提升由 applyMultiLegSizing 按 entryCount 判定。
+        const multiLegSizing = normalizeMultiLegSizing((riskConfig as any)?.multiLegSizing);
+        if (multiLegSizing === 'full') {
+          const sized = applyMultiLegSizing([routeParsed], multiLegSizing);
+          if (sized[0] !== routeParsed) {
+            routeParsed = sized[0];
+            debugRouting('route parsed strategy updated by multi-leg sizing %o', {
+              strategyId: strategy.id,
+              routeId,
+              exchangeInstanceId,
+              routeParsed: summarizeParsedStrategy(routeParsed),
+            });
+          }
         }
 
         debugOrder('trade execution requested %o', {

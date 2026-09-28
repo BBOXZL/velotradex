@@ -4,6 +4,7 @@ import redisService from './RedisService';
 import { ExchangeInstance } from '../models';
 import { isVirtualExchangeType } from '../utils/virtualTypes';
 import logger, { formatError } from '../utils/logger';
+import { discordGatewayManager } from './DiscordGatewayManager';
 
 /**
  * SystemStatusService —— 系统健康状态聚合服务
@@ -41,6 +42,21 @@ export interface ExchangeHealth {
   lastRESTErrorAt: number;
 }
 
+/**
+ * S8：Discord 接收健康维度（复用 DiscordGatewayManager.getStatus，
+ * 即 S1/S2 的 state/pending/lastMessageAt/channelCount/error/lastFailureMessageId）。
+ * 网关非 ready（degraded/reconnecting/failed 等）时 overall 降级，
+ * 这是“断 2 天无人知”的直接修复（见 G5）。
+ */
+export interface DiscordHealth {
+  state: string;
+  pending: number;
+  lastMessageAt: number | null;
+  channelCount: number;
+  error: string | null;
+  lastFailureMessageId?: string | null;
+}
+
 export interface SystemStatus {
   overall: 'ok' | 'degraded' | 'critical';
   timestamp: number;
@@ -64,6 +80,7 @@ export interface SystemStatus {
     lastCheckedAt: number;
   };
   exchanges: ExchangeHealth[];
+  discord: DiscordHealth;
 }
 
 class SystemStatusService {
@@ -249,6 +266,8 @@ class SystemStatusService {
   /** 构建同步快照（只读内存 + DB 查询结果，不做网络 I/O） */
   private buildStatusSync(dbInstances: ExchangeInstance[]): SystemStatus {
     const redis = redisService.getStatus();
+    // S8：Discord 健康直接复用网关快照（纯内存读取，不阻塞）。
+    const discord = this.readDiscordHealth();
 
     // DB 中的实例类型映射（运行时 IExchange 对象可能不携带 type 字段）
     const dbTypeMap = new Map<string, string>();
@@ -307,11 +326,14 @@ class SystemStatusService {
     const anyExchangeDown = exchangeHealths.some(
       (h) => !h.registered || !h.wsConnected || h.restOk === false
     );
+    // S8：网关非 ready（degraded/reconnecting/connecting/failed）即降级；
+    // stopped = 未配置/未启用，不计入降级（与网关语义一致）。
+    const discordDegraded = discord.state !== 'ready' && discord.state !== 'stopped';
 
     let overall: SystemStatus['overall'] = 'ok';
     if (dbOk === false) {
       overall = 'critical';
-    } else if (!redisOk || anyExchangeDown) {
+    } else if (!redisOk || anyExchangeDown || discordDegraded) {
       overall = 'degraded';
     }
 
@@ -338,7 +360,32 @@ class SystemStatusService {
         lastCheckedAt: this.lastDbCheckAt,
       },
       exchanges: exchangeHealths,
+      discord,
     };
+  }
+
+  /** S8：Discord 健康快照（纯内存读取；网关未初始化时按 stopped 处理）。 */
+  private readDiscordHealth(): DiscordHealth {
+    try {
+      const s: any = discordGatewayManager.getStatus() || {};
+      return {
+        state: String(s.state || 'stopped'),
+        pending: Number(s.pending) || 0,
+        lastMessageAt: s.lastMessageAt ?? null,
+        channelCount: Number(s.channelCount) || 0,
+        error: s.error ?? null,
+        lastFailureMessageId: s.lastFailureMessageId ?? null,
+      };
+    } catch {
+      return {
+        state: 'stopped',
+        pending: 0,
+        lastMessageAt: null,
+        channelCount: 0,
+        error: null,
+        lastFailureMessageId: null,
+      };
+    }
   }
 }
 

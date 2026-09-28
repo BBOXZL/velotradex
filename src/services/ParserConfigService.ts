@@ -168,6 +168,10 @@ export class ParserConfigService {
         if (config.entrySelection !== undefined && config.entrySelection !== null && config.entrySelection !== '' && config.entrySelection !== 'all' && config.entrySelection !== 'nearest_sl') {
             return 'entrySelection must be "all" or "nearest_sl".';
         }
+
+        if (config.multiLegSizing !== undefined && config.multiLegSizing !== null && config.multiLegSizing !== '' && config.multiLegSizing !== 'split' && config.multiLegSizing !== 'full') {
+            return 'multiLegSizing must be "split" or "full".';
+        }
         
         if (config.entryMergeThresholdR !== undefined) {
             const val = parseFloat(config.entryMergeThresholdR);

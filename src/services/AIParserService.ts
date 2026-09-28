@@ -6,7 +6,7 @@ import marketService from './MarketService';
 import { AsyncLocalStorage } from 'async_hooks';
 import { normalizeResult } from './AIParserResponseNormalizer';
 import { buildRetryAnalyzeOptions } from './AIParserRetryOptions';
-import { isAliyunCompatibleBaseUrl, normalizeProviderExtraPayload, parseExtraPayloadValue, resolveRequestTimeoutMs } from './AIParserProviderConfig';
+import { isAliyunCompatibleBaseUrl, normalizeAIBaseUrl, normalizeProviderExtraPayload, parseExtraPayloadValue, resolveRequestTimeoutMs } from './AIParserProviderConfig';
 import { buildPrompt, escapeXML } from './AIParserPromptBuilder';
 
 export type AIAction = 'open' | 'close' | 'update' | 'cancel' | 'ignore';
@@ -41,6 +41,46 @@ export interface AIAnalysisOptions {
     routeNames?: string[];
     timeout?: number;
     stripChinese?: boolean;
+    // S6: upstream retry tuning.attempts total (default 3: 1 initial + 2 retries
+    // per D3 0s/5s/30s backoff); 4xx never retries.
+    maxAttempts?: number;
+    retryDelaysMs?: number[];
+    // S6: when set and all attempts fail, the payload is handed to the delay
+    // queue instead of being silently dropped. Carries the Discord identity so
+    // the worker can repost to handleChannelMessage with original timestamps.
+    delayContext?: AIDelayEnqueueContext;
+}
+
+export interface AIDelayEnqueueContext {
+    messageId: string;
+    channelId: string;
+    rawMessage?: any;
+    routeIds?: number[];
+    routeNames?: string[];
+}
+
+export interface AIUpstreamRetryConfig {
+    maxAttempts?: number;
+    retryDelaysMs?: number[];
+}
+
+function resolveUpstreamRetry(options: AIAnalysisOptions, env: NodeJS.ProcessEnv = process.env): { maxAttempts: number; retryDelaysMs: number[] } {
+    const fromEnv = (name: string): number | undefined => {
+        const raw = env[name];
+        if (raw === undefined || raw === '') return undefined;
+        const parsed = name.includes('DELAYS') ? null : Number(raw);
+        return parsed as number | undefined;
+    };
+    const maxAttempts = Number.isFinite(options.maxAttempts as number) && (options.maxAttempts as number) > 0
+        ? Math.floor(options.maxAttempts as number)
+        : (Number.isFinite(fromEnv('AI_UPSTREAM_MAX_ATTEMPTS') as number) && (fromEnv('AI_UPSTREAM_MAX_ATTEMPTS') as number) > 0
+            ? Math.floor(fromEnv('AI_UPSTREAM_MAX_ATTEMPTS') as number)
+            : AIParserService.DEFAULT_UPSTREAM_MAX_ATTEMPTS);
+    const delays = options.retryDelaysMs
+        ?? (env.AI_UPSTREAM_RETRY_DELAYS_MS
+            ? String(env.AI_UPSTREAM_RETRY_DELAYS_MS).split(',').map(s => Number(s.trim())).filter(n => Number.isFinite(n) && n >= 0)
+            : AIParserService.DEFAULT_UPSTREAM_RETRY_DELAYS_MS);
+    return { maxAttempts, retryDelaysMs: delays.length ? delays : AIParserService.DEFAULT_UPSTREAM_RETRY_DELAYS_MS };
 }
 
 export interface AIRetrySourceLog {
@@ -57,7 +97,41 @@ export interface AIRetrySourceLog {
 type AnalyzeRawResult = { content: string; usage: any; raw: any; logId?: number };
 type AIRouteContext = { routeIds?: number[]; routeNames?: string[] };
 
+function extractAIResponseContent(data: any): string {
+    const choice = data?.choices?.[0];
+    const content = choice?.message?.content ?? choice?.text ?? data?.output_text;
+    if (typeof content === 'string') return content.trim();
+    if (Array.isArray(content)) {
+        return content
+            .map((part: any) => typeof part === 'string' ? part : part?.text ?? part?.content ?? '')
+            .filter(Boolean)
+            .join('')
+            .trim();
+    }
+    const output = Array.isArray(data?.output) ? data.output : [];
+    return output
+        .flatMap((item: any) => Array.isArray(item?.content) ? item.content : [])
+        .map((part: any) => part?.text ?? part?.content ?? '')
+        .filter(Boolean)
+        .join('')
+        .trim();
+}
+
 export { buildRetryAnalyzeOptions };
+
+export function isRetriableAIError(error: any): boolean {
+    const message = String(error?.message || '');
+    const status = Number(error?.response?.status);
+    if (Number.isFinite(status)) {
+        // 4xx (auth/validation/rate-limit-shape) never retries; 5xx retries.
+        if (status >= 500) return true;
+        return false;
+    }
+    if (error?.code === 'ECONNABORTED' || error?.code === 'ETIMEDOUT' || error?.code === 'ERR_NETWORK') return true;
+    if (/timeout|timed out|temporarily unavailable|econnreset|socket hang up/i.test(message)) return true;
+    if (/empty response from ai/i.test(message)) return true;
+    return false;
+}
 
 function buildRouteLogFields(options: Pick<AIAnalysisOptions, 'routeIds' | 'routeNames'> | AIRouteContext) {
     return {
@@ -72,9 +146,15 @@ function serializeLogMessage(value: unknown): string | null {
 }
 
 class AIParserService {
+    static readonly DEFAULT_UPSTREAM_MAX_ATTEMPTS = 3;
+    // D3 default: immediate first retry, then 5s, then 30s.
+    static readonly DEFAULT_UPSTREAM_RETRY_DELAYS_MS = [0, 5000, 30000];
     private client: AxiosInstance | null = null;
     private config: AIConfig | null = null;
     private routeContextStorage = new AsyncLocalStorage<AIRouteContext>();
+    // S6 delay queue is wired by composition root (serviceStartup); kept as a
+    // duck-typed hook so unit tests can inject a fake without importing models.
+    public delayQueue: { enqueue: (entry: any) => Promise<unknown> } | null = null;
 
     constructor() {
         this.reloadConfig();
@@ -86,7 +166,7 @@ class AIParserService {
             if (config) {
                 this.config = config;
 
-                const baseURL = config.baseUrl || 'https://api.openai.com/v1';
+                const baseURL = normalizeAIBaseUrl(config.baseUrl);
                 this.client = axios.create({
                     baseURL: baseURL,
                     headers: {
@@ -140,130 +220,166 @@ class AIParserService {
         let imageBase64ToSave: string | null = null;
         let processedSystemPrompt = options.systemPrompt;
 
-        try {
-            const messages: any[] = [];
-            let processedUserContent = options.userContent;
+        const maxAttempts = resolveUpstreamRetry(options).maxAttempts;
+        const retryDelays = resolveUpstreamRetry(options).retryDelaysMs;
 
-            const shouldStripChinese = options.stripChinese !== undefined ? options.stripChinese : this.config.stripChinese;
-            if (shouldStripChinese) {
-                if (processedSystemPrompt) {
-                    processedSystemPrompt = processedSystemPrompt.replace(/[\u4e00-\u9fa5]/g, '');
-                }
-                if (typeof processedUserContent === 'string') {
-                    processedUserContent = processedUserContent.replace(/[\u4e00-\u9fa5]/g, '');
-                } else if (Array.isArray(processedUserContent)) {
-                    processedUserContent = processedUserContent.map((item: any) => {
-                        if (item.type === 'text' && typeof item.text === 'string') {
-                            return { ...item, text: item.text.replace(/[\u4e00-\u9fa5]/g, '') };
-                        }
-                        return item;
-                    });
-                }
-            }
+        // S6: build the request once (prompt/payload are deterministic), then
+        // retry only the upstream POST on 5xx/timeout/empty-response. Every
+        // attempt writes its own ai_logs row (error or success), satisfying the
+        // "2 error + 1 success" acceptance evidence.
+        const messages: any[] = [];
+        let processedUserContent = options.userContent;
 
+        const shouldStripChinese = options.stripChinese !== undefined ? options.stripChinese : this.config.stripChinese;
+        if (shouldStripChinese) {
             if (processedSystemPrompt) {
-                messages.push({ role: 'system', content: processedSystemPrompt });
+                processedSystemPrompt = processedSystemPrompt.replace(/[\u4e00-\u9fa5]/g, '');
             }
-            if (processedUserContent) {
-                messages.push({ role: 'user', content: processedUserContent });
-            }
-
             if (typeof processedUserContent === 'string') {
-                promptToSave = processedUserContent;
+                processedUserContent = processedUserContent.replace(/[\u4e00-\u9fa5]/g, '');
             } else if (Array.isArray(processedUserContent)) {
-                const promptArray = processedUserContent.map((item: any) => {
-                    if (item.type === 'image_url') {
-                        imageBase64ToSave = item.image_url?.url || null;
-                        return { type: 'image_url', image_url: { url: '[IMAGE_DATA]' } };
+                processedUserContent = processedUserContent.map((item: any) => {
+                    if (item.type === 'text' && typeof item.text === 'string') {
+                        return { ...item, text: item.text.replace(/[\u4e00-\u9fa5]/g, '') };
                     }
                     return item;
                 });
-                promptToSave = JSON.stringify(promptArray);
             }
-
-            const providerExtraPayload = normalizeProviderExtraPayload(
-                {
-                    ...parseExtraPayloadValue(this.config?.extraPayload),
-                    ...(options.extraPayload || {})
-                },
-                this.config?.baseUrl
-            );
-            const payload: any = {
-                model,
-                messages,
-                temperature: 0.3,
-                ...providerExtraPayload
-            };
-
-            // P0: 未显式配置 max_tokens / max_completion_tokens 时兜底设置，
-            // 防止 LLM 在 strict json_schema 输出较长时被默认 token 上限截断
-            // （截断的 JSON 无法被解析，表现为解析器持续返回 null）。
-            if (payload.max_tokens === undefined && payload.max_completion_tokens === undefined) {
-                payload.max_tokens = 2048;
-            }
-
-            if (options.responseFormat) {
-                payload.response_format = options.responseFormat;
-            }
-
-            const response = await this.client.post('/chat/completions', payload, {
-                timeout: resolveRequestTimeoutMs(options.timeout, this.config?.requestTimeoutMs)
-            });
-
-            const choice = response.data.choices?.[0];
-            finalResponseContent = choice?.message?.content;
-
-            if (!finalResponseContent) throw new Error('Empty response from AI (analyzeRaw)');
-
-            const duration = Date.now() - startTime;
-            const usage = response.data.usage;
-
-            // Log usage
-            const logRecord = await AILog.create({
-                strategyId: options.strategyId || null,
-                ...this.resolveRouteLogFields(options),
-                model,
-                originalMessage: serializeLogMessage(options.originalMessage) || serializeLogMessage(options.userContent),
-                systemPrompt: processedSystemPrompt || null,
-                prompt: promptToSave,
-                response: finalResponseContent,
-                promptTokens: usage?.prompt_tokens || 0,
-                completionTokens: usage?.completion_tokens || 0,
-                totalTokens: usage?.total_tokens || 0,
-                durationMs: duration,
-                status: 'success',
-                imageBase64: imageBase64ToSave
-            });
-
-            return {
-                content: finalResponseContent,
-                usage,
-                raw: response.data,
-                logId: logRecord.id,
-            };
-
-        } catch (error: any) {
-            const duration = Date.now() - startTime;
-            const errorMsg = error.response?.data?.error?.message || error.message;
-            logger.error('AI Analysis (Raw) failed', { error: errorMsg, status: error.response?.status });
-
-            // Log failure
-            await AILog.create({
-                strategyId: options.strategyId || null,
-                ...this.resolveRouteLogFields(options),
-                model: model || 'unknown',
-                originalMessage: serializeLogMessage(options.originalMessage) || serializeLogMessage(options.userContent),
-                systemPrompt: processedSystemPrompt || null,
-                prompt: promptToSave || 'Error building prompt',
-                response: null,
-                durationMs: duration,
-                status: 'error',
-                error: errorMsg,
-                imageBase64: imageBase64ToSave
-            });
-
-            throw error; // re-throw for specific parser to handle failure log
         }
+
+        if (processedSystemPrompt) {
+            messages.push({ role: 'system', content: processedSystemPrompt });
+        }
+        if (processedUserContent) {
+            messages.push({ role: 'user', content: processedUserContent });
+        }
+
+        if (typeof processedUserContent === 'string') {
+            promptToSave = processedUserContent;
+        } else if (Array.isArray(processedUserContent)) {
+            const promptArray = processedUserContent.map((item: any) => {
+                if (item.type === 'image_url') {
+                    imageBase64ToSave = item.image_url?.url || null;
+                    return { type: 'image_url', image_url: { url: '[IMAGE_DATA]' } };
+                }
+                return item;
+            });
+            promptToSave = JSON.stringify(promptArray);
+        }
+
+        const providerExtraPayload = normalizeProviderExtraPayload(
+            {
+                ...parseExtraPayloadValue(this.config?.extraPayload),
+                ...(options.extraPayload || {})
+            },
+            this.config?.baseUrl
+        );
+        const payload: any = {
+            model,
+            messages,
+            temperature: 0.3,
+            ...providerExtraPayload
+        };
+
+        // P0: 未显式配置 max_tokens / max_completion_tokens 时兜底设置，
+        // 防止 LLM 在 strict json_schema 输出较长时被默认 token 上限截断
+        // （截断的 JSON 无法被解析，表现为解析器持续返回 null）。
+        if (payload.max_tokens === undefined && payload.max_completion_tokens === undefined) {
+            payload.max_tokens = 2048;
+        }
+
+        if (options.responseFormat) {
+            payload.response_format = options.responseFormat;
+        }
+
+        const requestTimeout = resolveRequestTimeoutMs(options.timeout, this.config?.requestTimeoutMs);
+        let attempt = 0;
+        let lastError: any = null;
+        while (attempt < maxAttempts) {
+            attempt++;
+            try {
+                const response = await this.client.post('/chat/completions', payload, {
+                    timeout: requestTimeout,
+                });
+
+                finalResponseContent = extractAIResponseContent(response.data);
+
+                if (!finalResponseContent) throw new Error('Empty response from AI (analyzeRaw)');
+
+                const duration = Date.now() - startTime;
+                const usage = response.data.usage;
+
+                // Log usage
+                const logRecord = await AILog.create({
+                    strategyId: options.strategyId || null,
+                    ...this.resolveRouteLogFields(options),
+                    model,
+                    originalMessage: serializeLogMessage(options.originalMessage) || serializeLogMessage(options.userContent),
+                    systemPrompt: processedSystemPrompt || null,
+                    prompt: promptToSave,
+                    response: finalResponseContent,
+                    promptTokens: usage?.prompt_tokens || 0,
+                    completionTokens: usage?.completion_tokens || 0,
+                    totalTokens: usage?.total_tokens || 0,
+                    durationMs: duration,
+                    status: 'success',
+                    imageBase64: imageBase64ToSave
+                });
+
+                return {
+                    content: finalResponseContent,
+                    usage,
+                    raw: response.data,
+                    logId: logRecord.id,
+                };
+            } catch (error: any) {
+                lastError = error;
+                const duration = Date.now() - startTime;
+                const errorMsg = error.response?.data?.error?.message || error.message;
+                logger.error('AI Analysis (Raw) failed', { error: errorMsg, status: error.response?.status, attempt });
+
+                // Log failure (one row per attempt)
+                await AILog.create({
+                    strategyId: options.strategyId || null,
+                    ...this.resolveRouteLogFields(options),
+                    model: model || 'unknown',
+                    originalMessage: serializeLogMessage(options.originalMessage) || serializeLogMessage(options.userContent),
+                    systemPrompt: processedSystemPrompt || null,
+                    prompt: promptToSave || 'Error building prompt',
+                    response: null,
+                    durationMs: duration,
+                    status: 'error',
+                    error: errorMsg,
+                    imageBase64: imageBase64ToSave
+                });
+
+                if (attempt >= maxAttempts || !isRetriableAIError(error)) {
+                    break;
+                }
+                const delayMs = retryDelays[Math.min(attempt - 1, retryDelays.length - 1)] ?? 0;
+                if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs));
+            }
+        }
+
+        // S6: all attempts exhausted — hand to the delay queue when the caller
+        // supplied Discord identity, then re-throw for the parser to handle.
+        if (options.delayContext && this.delayQueue) {
+            await this.delayQueue.enqueue({
+                messageId: options.delayContext.messageId,
+                channelId: options.delayContext.channelId,
+                rawMessage: options.delayContext.rawMessage ?? options.originalMessage ?? null,
+                routeIds: options.delayContext.routeIds,
+                routeNames: options.delayContext.routeNames,
+                originalTimestamp: (options.originalMessage as any)?.ts
+                    ?? (options.originalMessage as any)?.timestamp ?? null,
+                retryCount: 0,
+                nextRetryAt: new Date(Date.now() + 60_000),
+            }).catch((enqueueError: any) => {
+                logger.error('AI delay queue enqueue failed', { error: enqueueError?.message });
+            });
+        }
+
+        throw lastError; // re-throw for specific parser to handle failure log
     }
 
     private async runAnalysisInternal(
@@ -388,7 +504,7 @@ class AIParserService {
 
         // If config provided, create a temporary client
         if (config && config.apiKey) {
-            const baseURL = config.baseUrl || 'https://api.openai.com/v1';
+            const baseURL = normalizeAIBaseUrl(config.baseUrl);
             client = axios.create({
                 baseURL: baseURL,
                 headers: {
@@ -412,7 +528,7 @@ class AIParserService {
 
     public async testConfig(config: any): Promise<{ success: boolean, message: string }> {
         try {
-            const baseURL = config.baseUrl || 'https://api.openai.com/v1';
+            const baseURL = normalizeAIBaseUrl(config.baseUrl);
             const client = axios.create({
                 baseURL: baseURL,
                 headers: {
@@ -429,7 +545,7 @@ class AIParserService {
                 ...normalizeProviderExtraPayload(parseExtraPayloadValue(config.extraPayload), config.baseUrl)
             });
 
-            const content = response.data?.choices?.[0]?.message?.content;
+            const content = extractAIResponseContent(response.data);
             if (!content || !String(content).trim()) {
                 return { success: false, message: '模型调用成功但未返回内容' };
             }

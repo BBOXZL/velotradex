@@ -16,9 +16,16 @@ export function convertToStrategies(result: LLMResult, rawMessage: any, logPrefi
         return null;
     }
 
-    if (!result.symbol) {
+    // S3 同类单源问题补齐：update/close 允许用原文/上下文回填缺失 symbol，
+    // 失败继续返回 null（与 GaulsParser 双空 return null 一致）。
+    const backfilledSymbol = result.symbol || extractSymbolFromManagementMessage(rawMessage);
+    if (!backfilledSymbol) {
         logger.warn(`${logPrefix} No symbol in LLM result`);
         return null;
+    }
+    if (!result.symbol) {
+        logger.info(`${logPrefix} update symbol backfilled from message context`, { symbol: backfilledSymbol });
+        result = { ...result, symbol: backfilledSymbol };
     }
 
     const symbol = result.symbol;
@@ -151,6 +158,21 @@ export function convertToStrategies(result: LLMResult, rawMessage: any, logPrefi
 }
 
 // ─── Conversion Decision Helpers ─────────────────────────────────────────
+
+/**
+ * S3 同类单源补齐：从管理类短文本原文回填缺失 symbol。
+ * 仅识别显式 BASE_QUOTE / $BASE / BASE_USDT；无命中返回 undefined，
+ * 由调用方继续走双空 return null。
+ */
+export function extractSymbolFromManagementMessage(rawMessage: any): string | undefined {
+    const content = String(rawMessage?.content || '');
+    if (!content) return undefined;
+    const m = content.match(/\$([A-Za-z]{2,15})\b/) || content.match(/\b([A-Za-z]{2,15})_USDT\b/i);
+    if (!m) return undefined;
+    const base = m[1].replace(/^\$/, '').toUpperCase();
+    if (!base) return undefined;
+    return `${base}_USDT`;
+}
 
 export function shouldConvertToBreakevenUpdate(
     result: LLMResult,

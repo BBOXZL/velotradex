@@ -271,6 +271,42 @@ describe('AIParserService analyzeRaw extraPayload', () => {
       prompt: '<current_message>processed prompt</current_message>',
     }));
   });
+
+  test('analyzeRaw accepts OpenAI-compatible array content blocks', async () => {
+    const { post } = setupService();
+    post.mockResolvedValueOnce({
+      data: {
+        choices: [{
+          message: {
+            content: [{ type: 'text', text: '{"action":"ignore","symbol":"BTC_USDT"}' }],
+          },
+        }],
+        usage: {},
+      },
+    });
+
+    const result = await aiParserService.analyzeRaw({ userContent: 'hello' });
+
+    expect(result?.content).toBe('{"action":"ignore","symbol":"BTC_USDT"}');
+  });
+
+  test('analyzeRaw extracts JSON from a fenced response with surrounding text', async () => {
+    const { post } = setupService();
+    post.mockResolvedValueOnce({
+      data: {
+        choices: [{
+          message: {
+            content: 'Here is the result:\n```json\n{"action":"ignore","symbol":"BTC_USDT"}\n```\n',
+          },
+        }],
+        usage: {},
+      },
+    });
+
+    const result = await aiParserService.analyzeRaw({ userContent: 'hello' });
+
+    expect(result?.content).toContain('"action":"ignore"');
+  });
 });
 
 describe('AIParserService prompt market price context', () => {
@@ -311,6 +347,22 @@ describe('AIParserService prompt market price context', () => {
     expect(prompt).toContain('WWG embed description should be analyzed');
     expect(prompt).not.toContain('content should not be analyzed');
     expect(prompt).not.toContain('second embed should not be analyzed');
+  });
+});
+
+describe('AI endpoint normalization', () => {
+  test.each([
+    ['https://ai.example.com', 'https://ai.example.com/v1'],
+    ['https://ai.example.com/v1/', 'https://ai.example.com/v1'],
+    ['https://ai.example.com/v1/chat/completions', 'https://ai.example.com/v1'],
+    ['https://ai.example.com/custom/v2', 'https://ai.example.com/custom/v2'],
+  ])('uses an API base for %s', async (baseUrl, expected) => {
+    const post = jest.fn().mockResolvedValue({
+      data: { choices: [{ message: { content: 'OK' } }] },
+    });
+    const spy = jest.spyOn(axios, 'create').mockReturnValue({ post } as any);
+    await aiParserService.testConfig({ baseUrl, apiKey: 'key', textModel: 'model' });
+    expect(spy).toHaveBeenCalledWith(expect.objectContaining({ baseURL: expected }));
   });
 });
 

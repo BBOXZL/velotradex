@@ -1,14 +1,21 @@
 import { ParsedStrategy, StrategyRiskConfig } from './parsers/types';
 import { parseFinitePositiveNumber, isCmpEntryPrice, formatExecutionNumber } from './TradeMath';
 import logger from '../utils/logger';
+import signalAlertService from './SignalAlertService';
 
 const DISPLAY_PRICE_SCALE_FACTORS = [100, 1000, 10000, 1000000];
 
-export function detectDisplayPriceScaleFactor(entryPrice: number, currentPrice: number): number | null {
+// S5: 单字段错位判定阈值(默认50倍)。只有 value/currentPrice 偏离超阈值
+// (且命中 factors 的 0.2 偏差带) 的字段才归一化, 正常字段保持原值。
+export const DISPLAY_PRICE_SCALE_DEVIATION_THRESHOLD = 50;
+
+export function detectDisplayPriceScaleFactor(entryPrice: number, currentPrice: number, deviationThreshold: number = DISPLAY_PRICE_SCALE_DEVIATION_THRESHOLD): number | null {
     if (!Number.isFinite(entryPrice) || entryPrice <= 0 || !Number.isFinite(currentPrice) || currentPrice <= 0) {
         return null;
     }
     const ratio = entryPrice / currentPrice;
+    // 阈值门: 偏离不足阈值倍数视为正常价格, 不归一化
+    if (ratio < deviationThreshold) return null;
     for (const factor of DISPLAY_PRICE_SCALE_FACTORS) {
         const deviation = Math.abs(ratio - factor) / factor;
         if (deviation <= 0.2) {
@@ -31,24 +38,83 @@ export function normalizeDisplayPriceScale(params: {
         stopLoss: number;
     };
     currentPrice: number;
-}): { parsed: ParsedStrategy; scaleFactor: number } | null {
-    const scaleFactor = detectDisplayPriceScaleFactor(params.signal.entryPrice, params.currentPrice);
-    if (!scaleFactor) return null;
+}): { parsed: ParsedStrategy; scaleFactor: number; normalizedFields: string[] } | null {
+    if (!Number.isFinite(params.currentPrice) || params.currentPrice <= 0) return null;
 
-    const normalizedEntryPrice = normalizeDisplayPrice(params.parsed.entryPrice, scaleFactor);
-    const normalizedStopLoss = normalizeDisplayPrice(params.parsed.stopLoss, scaleFactor);
-    if (!normalizedEntryPrice || !normalizedStopLoss) return null;
+    // S5 逐字段化: 对 entry / SL / 每个 TP 分别算 value/currentPrice,
+    // 仅偏离超阈值(默认50倍, factors 覆盖 100/1000/10000/1000000,
+    // 0.2 偏差逻辑保留在 detectDisplayPriceScaleFactor 内)的字段归一化。
+    const entryNum = parseFinitePositiveNumber(params.parsed.entryPrice);
+    const slNum = parseFinitePositiveNumber(params.parsed.stopLoss);
+    if (entryNum === null) return null;
+
+    const entryFactor = detectDisplayPriceScaleFactor(entryNum, params.currentPrice);
+    // entry 无错位 -> 整单不归一化(保持旧行为: 无错位返回 null)
+    if (!entryFactor) return null;
+
+    const normalizedEntryPrice = normalizeDisplayPrice(params.parsed.entryPrice, entryFactor);
+    if (!normalizedEntryPrice) return null;
+
+    let normalizedStopLoss = params.parsed.stopLoss;
+    if (slNum !== null) {
+        const slFactor = detectDisplayPriceScaleFactor(slNum, params.currentPrice);
+        if (slFactor) {
+            const v = normalizeDisplayPrice(params.parsed.stopLoss, slFactor);
+            if (v) normalizedStopLoss = v;
+        }
+    }
 
     const normalizedTargets = Array.isArray(params.parsed.targets)
-        ? params.parsed.targets.map((target) => normalizeDisplayPrice(target, scaleFactor) || target)
+        ? params.parsed.targets.map((target) => {
+            const tpNum = parseFinitePositiveNumber(target);
+            if (tpNum === null) return target;
+            const tpFactor = detectDisplayPriceScaleFactor(tpNum, params.currentPrice);
+            if (!tpFactor) return target;
+            return normalizeDisplayPrice(target, tpFactor) || target;
+        })
         : params.parsed.targets;
+
     const normalizedAverageEntryPrice =
         typeof params.parsed.averageEntryPrice === 'number' && Number.isFinite(params.parsed.averageEntryPrice) && params.parsed.averageEntryPrice > 0
-            ? params.parsed.averageEntryPrice / scaleFactor
+            ? (() => {
+                const avgFactor = detectDisplayPriceScaleFactor(params.parsed.averageEntryPrice as number, params.currentPrice);
+                return avgFactor ? (params.parsed.averageEntryPrice as number) / avgFactor : params.parsed.averageEntryPrice;
+            })()
             : params.parsed.averageEntryPrice;
 
+    const normalizedFields: string[] = ['entryPrice'];
+    if (normalizedStopLoss !== params.parsed.stopLoss) normalizedFields.push('stopLoss');
+    if (JSON.stringify(normalizedTargets) !== JSON.stringify(params.parsed.targets)) normalizedFields.push('targets');
+    if (normalizedAverageEntryPrice !== params.parsed.averageEntryPrice) normalizedFields.push('averageEntryPrice');
+
+    // 归一化后 sanity 检查: 多头 SL<entry<TP, 空头 SL>entry>TP。
+    // 不满足 -> 拒绝归一化(返回 null), 由调用方打 warn + STRATEGY_PRICE_SCALE_REJECTED,
+    // 按原值走后续校验(不静默造单)。
+    const candidateEntry = parseFinitePositiveNumber(normalizedEntryPrice);
+    const candidateSl = parseFinitePositiveNumber(normalizedStopLoss);
+    const candidateTps = Array.isArray(normalizedTargets)
+        ? normalizedTargets.map((t) => parseFinitePositiveNumber(t)).filter((t): t is number => t !== null)
+        : [];
+    const side = params.parsed.side;
+    if (candidateEntry !== null && candidateSl !== null && (side === 'buy' || side === 'sell')) {
+        const isLong = side === 'buy';
+        const slOk = isLong ? candidateSl < candidateEntry : candidateSl > candidateEntry;
+        const tpOk = candidateTps.length === 0 || candidateTps.every((tp) => isLong ? candidateEntry < tp : candidateEntry > tp);
+        if (!slOk || !tpOk) {
+            logger.warn('TradeExecutor: display price scale sanity check failed, rejecting normalization', {
+                symbol: params.parsed.symbol,
+                side,
+                entryPrice: normalizedEntryPrice,
+                stopLoss: normalizedStopLoss,
+                targets: normalizedTargets,
+            });
+            return null;
+        }
+    }
+
     return {
-        scaleFactor,
+        scaleFactor: entryFactor,
+        normalizedFields,
         parsed: {
             ...params.parsed,
             entryPrice: normalizedEntryPrice,
@@ -157,6 +223,14 @@ export async function rejectOpenStrategy(
             exchangeInstanceId
         );
     }
+    // S8: 拦截可观测 —— 除日志 + 审计外再写告警落库（面板红点）。
+    await signalAlertService.raise({
+        strategyId: strategyId ?? null,
+        kind: 'STRATEGY_REJECTED',
+        symbol: details?.symbol != null ? String(details.symbol) : null,
+        exchangeInstanceId: exchangeInstanceId ?? null,
+        reason: details?.reason ?? null,
+    });
     logger.warn('TradeExecutor: open strategy rejected', {
         field: details.field,
         reason: details.reason,

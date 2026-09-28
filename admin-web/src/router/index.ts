@@ -94,6 +94,11 @@ const routes = [
         component: () => import('../views/AIConfig.vue')
       },
       {
+        path: 'discord-config',
+        name: 'DiscordConfig',
+        component: () => import('../views/DiscordConfig.vue')
+      },
+      {
         path: 'logs',
         name: 'Logs',
         component: () => import('../views/Logs.vue')

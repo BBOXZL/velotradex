@@ -10,10 +10,11 @@ import { PositionSizer } from '../PositionSizer';
 import { TpSlCalculator } from '../TpSlCalculator';
 import { CfdLegPlanner } from '../exchanges/gate_cfd/CfdLegPlanner';
 import { parsePositiveAmount, parseFinitePositiveNumber, isCmpEntryPrice, isFilledOrderStatus, formatExecutionNumber, roundToPrecision } from '../TradeMath';
-import { buildCmpResolvedOpenStrategy, rejectOpenStrategy, validateOpenSignal, validateStaticOpenSignal, normalizeDisplayPriceScale } from '../OpenSignalValidator';
+import { buildCmpResolvedOpenStrategy, rejectOpenStrategy, validateOpenSignal, validateStaticOpenSignal, normalizeDisplayPriceScale, detectDisplayPriceScaleFactor } from '../OpenSignalValidator';
 import { applyOpenPriceAdjustments } from '../OpenPriceAdjustment';
 import { ExecutorServices, ExecutorCapabilities, summarizeParsedForDebug } from './deps';
 import { ClosePositionService } from './ClosePositionService';
+import signalAlertService from '../SignalAlertService';
 import cfdPriceSyncService from '../CfdPriceSyncService';
 import { nowOrSim } from '../../backtest/Clock';
 
@@ -432,6 +433,38 @@ export class OpenPositionService {
         signal: staticOpenSignal,
         currentPrice: currentPriceForNormalization || 0,
     });
+    // S5: entry错位但sanity拒绝归一化时 -> 打warn + STRATEGY_PRICE_SCALE_REJECTED审计,
+    // 按原值走后续校验(不静默造单)。仅当entry确实错位(偏离阈值)但逐字段归一化
+    // 产出了非法结构(SL>=entry等)时触发; 无错位返回null时不打扰。
+    if (!displayPriceNormalization && strategyId && currentPriceForNormalization) {
+        const entryNumForRejectCheck = parseFinitePositiveNumber(normalizedParsed.entryPrice);
+        if (entryNumForRejectCheck !== null && detectDisplayPriceScaleFactor(entryNumForRejectCheck, currentPriceForNormalization)) {
+            logger.warn('TradeExecutor: display price scale normalization rejected by sanity check, proceeding with original values', {
+                symbol: normalizedParsed.symbol,
+                side: normalizedParsed.side,
+                entryPrice: normalizedParsed.entryPrice,
+                stopLoss: normalizedParsed.stopLoss,
+                targets: normalizedParsed.targets,
+                currentPrice: currentPriceForNormalization,
+            });
+            await this.services.auditService.log(
+                strategyId,
+                'STRATEGY_PRICE_SCALE_REJECTED',
+                {
+                    symbol: normalizedParsed.symbol,
+                    side: normalizedParsed.side,
+                    entryPrice: normalizedParsed.entryPrice,
+                    stopLoss: normalizedParsed.stopLoss,
+                    targets: normalizedParsed.targets,
+                    currentPrice: currentPriceForNormalization,
+                    reason: 'sanity_check_failed',
+                },
+                undefined,
+                undefined,
+                exchangeInstanceId
+            );
+        }
+    }
     if (displayPriceNormalization) {
         const originalEntryPrice = staticOpenSignal.entryPrice;
         const originalStopLoss = staticOpenSignal.stopLoss;
@@ -445,6 +478,7 @@ export class OpenPositionService {
                     symbol: normalizedParsed.symbol,
                     side: normalizedParsed.side,
                     scaleFactor: displayPriceNormalization.scaleFactor,
+                    normalizedFields: displayPriceNormalization.normalizedFields,
                     currentPrice: currentPriceForNormalization,
                     originalEntryPrice,
                     normalizedEntryPrice: staticOpenSignal.entryPrice,
@@ -549,6 +583,15 @@ export class OpenPositionService {
                 });
                 if (strategyId) await this.services.auditService.log(strategyId, 'MANUAL_INTERVENTION_BLOCKED', {
                     message: `Blocked auto-close of manual ${conflictSide} position and opening ${normalizedParsed.side}`
+                });
+                // S8: 拦截可观测 —— 除日志 + 审计外再写告警落库（面板红点）。
+                await signalAlertService.raise({
+                    strategyId: strategyId ?? null,
+                    kind: 'MANUAL_INTERVENTION_BLOCKED',
+                    symbol: normalizedParsed.symbol,
+                    routeId: routeId ?? null,
+                    exchangeInstanceId: exchangeInstanceId ?? null,
+                    reason: `Blocked auto-close of manual ${conflictSide} position and opening ${normalizedParsed.side}`,
                 });
                 return null;
             }
@@ -904,8 +947,14 @@ export class OpenPositionService {
         finalAmount: amount,
     });
     logger.info('Position size calculated', {
-      contracts, finalAmount: amount, riskMultiplier,
+      contracts, finalAmount: amount,
       sizingMode: riskConfig.positionSizingMode,
+      // S4: weight 与 riskMultiplier 是两条独立的风险缩放路径，分开打以便区分：
+      // weight = 多腿分摊（split 下 1/N，full/entrySelection 下 1）；
+      // riskMultiplier = 信号自带风险倍数（AI 的 0.5R / low risk 等）。
+      weight: normalizedParsed.weight,
+      riskMultiplier,
+      multiLegSizing: (riskConfig as any)?.multiLegSizing ?? 'split',
       configuredRisk: sizingResult.riskAmount,
       actualRisk: sizingResult.actualRisk,
     });

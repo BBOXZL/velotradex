@@ -153,6 +153,16 @@ export const getResponseAction = (log: any): string => {
   return '-'
 }
 
+/** S8：从 Response 中提取 ignore 的 reasoning；非 ignore 或缺失返回 '-'。 */
+export const getResponseReasoning = (log: any): string => {
+  const parsed = getResponseSummarySource(log?.response)
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    const reasoning = (parsed as Record<string, unknown>).reasoning
+    if (reasoning !== undefined && reasoning !== null && reasoning !== '') return String(reasoning)
+  }
+  return '-'
+}
+
 /** 将任意值格式化为可展示的 JSON 文本，失败时回退到原值或 fallback。 */
 export const formatJsonForDisplay = (value: any, fallback = ''): string => {
   if (value === null || value === undefined || value === '') {

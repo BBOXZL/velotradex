@@ -215,6 +215,11 @@ export class UpdateOrderService {
                     await targetOrder.save();
                 }
                 logger.info(`Successfully updated SL for ${parsed.symbol} to ${newSLPrice}`);
+                // G2 可观测：BE 挂单成功与兜底全平用不同审计动作区分
+                //（不改变 fallbackBreakevenToClose 的全平行为本身）。
+                if (strategyId && parsed.stopLoss?.toLowerCase() === 'breakeven') {
+                    await this.services.auditService.log(strategyId, 'BE_SL_PLACED', { symbol: parsed.symbol, newSL: newSLPrice, slOrderId: newSlId });
+                }
                 debugOrderUpdate('stop loss updated %o', {
                     strategyId,
                     exchangeInstanceId,
@@ -284,6 +289,10 @@ export class UpdateOrderService {
           exchangeInstanceId,
           symbol: parsed.symbol,
       });
+      // G2 可观测：BE 挂单失败走兜底全平时打专用审计（行为本身仍是全平，不改）。
+      if (strategyId) {
+          await this.services.auditService.log(strategyId, 'BE_FALLBACK_CLOSED', { symbol: parsed.symbol, reason: 'breakeven_sl_failed_fallback_close' });
+      }
       const closeParsed: ParsedStrategy = {
           action: 'close',
           symbol: parsed.symbol,

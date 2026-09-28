@@ -89,6 +89,47 @@
                 <div class="status-card__detail" v-else-if="restOk">行情接口正常</div>
                 <div class="status-card__detail status-card__error" v-else>行情接口请求失败</div>
             </div>
+
+            <!-- S8：Discord 接收状态卡（复用 /api/status 的 discord 维度；G5 修复：断线不再全绿） -->
+            <div class="status-card" :class="statusCardClass(discordOk, true)">
+                <div class="status-card__title">
+                    <el-icon :size="16"><ChatDotRound /></el-icon>
+                    Discord 接收
+                    <span class="status-pill" :class="discordOk === null ? 'pill-neutral' : discordOk ? 'pill-ok' : 'pill-fail'">
+                        <el-icon :size="12" v-if="discordOk !== null"><CircleCheck v-if="discordOk" /><CircleClose v-else /></el-icon>
+                        <span>{{ discordLabel }}</span>
+                    </span>
+                </div>
+                <div class="status-card__detail" v-if="discordOk === null">未配置/未启用</div>
+                <template v-else>
+                    <div class="status-card__detail">
+                        队列积压：{{ status.discord?.pending ?? 0 }} / 频道：{{ status.discord?.channelCount ?? 0 }}
+                    </div>
+                    <div class="status-card__detail" v-if="status.discord?.lastMessageAt">
+                        最后消息：{{ formatDate(status.discord.lastMessageAt) }}
+                    </div>
+                    <div class="status-card__detail status-card__error" v-if="status.discord?.error" :title="status.discord.error">
+                        {{ truncate(status.discord.error, 40) }}
+                    </div>
+                </template>
+            </div>
+
+            <!-- S8：拦截告警红点（落库 signal_alerts 未读计数） -->
+            <div class="status-card" :class="alertUnread > 0 ? 'status-card--error' : 'status-card--ok'">
+                <div class="status-card__title">
+                    <el-icon :size="16"><Bell /></el-icon>
+                    拦截告警
+                    <el-badge :value="alertUnread" :hidden="alertUnread === 0" :max="99" class="alert-badge" />
+                </div>
+                <div class="status-card__detail" v-if="alertUnread > 0">
+                    {{ alertUnread }} 条未读拦截（人工仓/风控拒绝），请前往 AI 解析 / 审计核对
+                </div>
+                <div class="status-card__detail" v-else>暂无未读拦截告警</div>
+                <div style="margin-top: 8px; display: flex; gap: 8px;">
+                    <el-button size="small" @click="fetchAlertUnread">刷新</el-button>
+                    <el-button v-if="alertUnread > 0" size="small" type="primary" @click="markAlertsRead">全部标已读</el-button>
+                </div>
+            </div>
         </div>
 
         <div class="status-footer">
@@ -224,6 +265,17 @@
                 </el-tag>
             </el-descriptions-item>
         </el-descriptions>
+        <div v-if="isAdmin" style="margin-top: 12px; display: flex; gap: 8px; align-items: center;">
+            <el-select v-model="pendingTradingMode" size="small" style="width: 140px;">
+                <el-option label="观察模式" value="observe" />
+                <el-option label="测试网" value="testnet" />
+                <el-option label="实盘" value="real" />
+            </el-select>
+            <el-button type="primary" size="small" :loading="switchingTradingMode" :disabled="pendingTradingMode === tradingConfig.mode" @click="switchTradingMode">
+                切换模式
+            </el-button>
+            <span style="font-size: 12px; color: var(--text-color-secondary);">即时生效；重启后恢复为服务器配置。切实盘前请确认风控与密钥无误。</span>
+        </div>
     </div>
 
     <!-- Version Information -->
@@ -267,7 +319,7 @@ import StatusBadge from '../components/StatusBadge.vue'
 import ExchangeLogo from '../components/ExchangeLogo.vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '../stores/auth'
-import { Coin, DataBoard, Connection, Odometer, Warning, CircleClose, CircleCheck, Refresh, Delete } from '@element-plus/icons-vue'
+import { Coin, DataBoard, Connection, Odometer, Warning, CircleClose, CircleCheck, Refresh, Delete, Bell, ChatDotRound } from '@element-plus/icons-vue'
 
 // Configure axios base url if needed, or rely on vite proxy
 const api = request
@@ -430,6 +482,45 @@ const restLabel = computed(() => {
     return restOk.value ? '正常' : '异常'
 })
 
+// S8：Discord 接收健康（stopped=未配置不告警；其余非 ready 即异常）
+const discordOk = computed<boolean | null>(() => {
+    const d = status.value?.discord
+    if (!d || !d.state) return null
+    if (d.state === 'stopped') return null
+    return d.state === 'ready'
+})
+
+const discordLabel = computed(() => {
+    const d = status.value?.discord
+    if (!d || !d.state || d.state === 'stopped') return '未启用'
+    if (d.state === 'ready') return '接收正常'
+    if (d.state === 'degraded') return '降级（仅接收）'
+    if (d.state === 'reconnecting' || d.state === 'connecting') return '重连中'
+    return '已断开'
+})
+
+// S8：拦截告警未读计数（面板红点）
+const alertUnread = ref(0)
+
+const fetchAlertUnread = async () => {
+    try {
+        const res = await api.get('/signal-alerts/unread-count')
+        alertUnread.value = Number(res.data?.unread) || 0
+    } catch (error) {
+        console.error('Failed to fetch alert unread count', error)
+    }
+}
+
+const markAlertsRead = async () => {
+    try {
+        await api.post('/signal-alerts/read')
+        ElMessage.success('已全部标为已读')
+        await fetchAlertUnread()
+    } catch (e: any) {
+        ElMessage.error(e?.response?.data?.error || '标已读失败')
+    }
+}
+
 const overallType = computed(() => {
     if (status.value?.overall === 'critical') return 'error'
     if (status.value?.overall === 'degraded') return 'warning'
@@ -474,6 +565,15 @@ const issues = computed(() => {
         }
     }
 
+    // S8：Discord 接收异常同样进问题列表（G5：断线不再全绿）
+    const discord = s.discord
+    if (discord && discord.state && discord.state !== 'ready' && discord.state !== 'stopped') {
+        let text = `Discord 接收异常（${discord.state}，积压 ${discord.pending ?? 0}）`
+        if (discord.error) text += `：${discord.error}`
+        text += '，请对账后重连（Discord 接收页）'
+        list.push({ level: 'error', text })
+    }
+
     return list
 })
 
@@ -502,8 +602,41 @@ const fetchTradingConfig = async () => {
     try {
         const res = await api.get('/config/trading-mode')
         tradingConfig.value = res.data
+        pendingTradingMode.value = res.data?.mode || 'observe'
     } catch (error) {
         console.error('Failed to fetch trading config', error)
+    }
+}
+
+// ---- 交易模式切换（admin）：运行时生效，重启后恢复为服务器配置 ----
+const pendingTradingMode = ref('observe')
+const switchingTradingMode = ref(false)
+
+const switchTradingMode = async () => {
+    const mode = pendingTradingMode.value
+    const modeLabel = mode === 'real' ? '实盘' : mode === 'testnet' ? '测试网' : '观察模式'
+    try {
+        await ElMessageBox.confirm(
+            mode === 'observe'
+                ? '切到观察模式后只解析信号、不下单，确定切换？'
+                : `切到${modeLabel}后新信号将真实下单（${modeLabel}），确定切换？`,
+            '切换交易模式',
+            { type: mode === 'observe' ? 'info' : 'warning', confirmButtonText: '确认切换', cancelButtonText: '取消' }
+        )
+    } catch {
+        return // 用户取消
+    }
+    switchingTradingMode.value = true
+    try {
+        const res = await api.post('/config/trading-mode', { mode })
+        tradingConfig.value = res.data
+        pendingTradingMode.value = res.data?.mode || mode
+        ElMessage.success(`已切换为${modeLabel}，下单${res.data?.enableTrading ? '已启用' : '已禁用'}`)
+    } catch (e: any) {
+        ElMessage.error(e?.response?.data?.error || '切换失败')
+        pendingTradingMode.value = tradingConfig.value.mode
+    } finally {
+        switchingTradingMode.value = false
     }
 }
 
@@ -521,7 +654,7 @@ const fetchStatus = async () => {
 }
 
 const manualRefresh = async () => {
-    await Promise.all([fetchStatus(), fetchData(), fetchTradingConfig()])
+    await Promise.all([fetchStatus(), fetchData(), fetchTradingConfig(), fetchAlertUnread()])
 }
 
 const fetchData = async () => {
@@ -560,10 +693,12 @@ onMounted(() => {
     fetchTradingConfig()
     fetchVersion()
     fetchStatus()
+    fetchAlertUnread()
     timer = setInterval(() => {
         fetchData()
         fetchTradingConfig()
         fetchStatus()
+        fetchAlertUnread()
     }, 5000)
 })
 
@@ -719,5 +854,10 @@ onUnmounted(() => {
 
 .status-pill .el-icon {
   display: inline-flex;
+}
+
+/* S8：拦截告警红点与徽标对齐 */
+.alert-badge {
+  margin-left: auto;
 }
 </style>
