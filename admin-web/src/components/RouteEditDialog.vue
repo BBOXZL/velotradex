@@ -355,6 +355,40 @@
             </el-select>
           </el-form-item>
         </el-col>
+        <el-col :span="12">
+          <el-form-item prop="riskSettings.multiLegSizing">
+            <template #label>
+              <span class="form-label-with-tip">
+                多腿风险分摊
+                <el-tooltip effect="dark" placement="top" raw-content>
+                  <template #content>
+                    <div style="max-width: 300px;">
+                      <strong>多腿风险分摊 (multiLegSizing)</strong><br/>
+                      <br/>
+                      <strong>说明：</strong><br/>
+                      • 控制多入场点信号的风险预算分配方式<br/>
+                      • 均分风险(split)：默认行为，每腿按权重 1/N 分摊（如双腿各 0.5）<br/>
+                      • 每腿全额(full)：每腿按全额风险预算下单（每腿权重=1）<br/>
+                      <br/>
+                      <strong>注意：full 下双腿全中约 2 倍风险！</strong><br/>
+                      <br/>
+                      <strong>示例：</strong><br/>
+                      风险预算 5U，双腿信号<br/>
+                      选 split → 每腿按 2.5U 下单<br/>
+                      选 full → 每腿按 5U 下单，双腿全中约 10U（2 倍风险）
+                    </div>
+                  </template>
+                  <el-icon class="tip-icon"><QuestionFilled /></el-icon>
+                </el-tooltip>
+              </span>
+            </template>
+            <el-select v-model="form.riskSettings.multiLegSizing" placeholder="默认 (均分风险)" style="width: 100%">
+              <el-option label="使用默认 (均分风险)" :value="undefined" />
+              <el-option label="均分风险 (Split)" value="split" />
+              <el-option label="每腿全额 (Full，约2倍风险)" value="full" />
+            </el-select>
+          </el-form-item>
+        </el-col>
       </el-row>
 
       <el-row :gutter="24" v-if="form.riskSettings.paddingMode === 'fixed'">
@@ -631,6 +665,7 @@ const form = reactive({
     fixedSlDistance: '',
     slBackOffsetFixed: '',
     entrySelection: undefined,
+    multiLegSizing: undefined,
     positionSizingMode: '',
     autoCloseOppositePosition: undefined,
     syncCfdPrice: false,
@@ -719,6 +754,7 @@ const resetRiskSettings = () => {
     fixedSlDistance: '',
     slBackOffsetFixed: '',
     entrySelection: undefined,
+    multiLegSizing: undefined,
     positionSizingMode: '',
     autoCloseOppositePosition: undefined,
     syncCfdPrice: false,

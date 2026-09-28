@@ -89,6 +89,14 @@ export interface StrategyRiskConfig {
   // 市价/CMP 入场点无价格，不参与"最近"比较（会被跳过）；单入场点信号不受影响。
   entrySelection?: 'all' | 'nearest_sl';
 
+  // 多腿风险分摊（S4, 默认 split 保持现状）：
+  // 'split'（默认）：多入场点按 weight=1/N 均分风险预算（现状行为）；
+  // 'full'：每腿按 weight=1 全额风险预算（双腿全中约 2 倍风险，面板开关旁已写明）。
+  // 与 entrySelection 的先后关系：entrySelection 先过滤（nearest_sl 跳过非最近腿），
+  // multiLegSizing 只作用于剩余腿的分摊。G4：CMP/市价腿无价格，不参与 nearest_sl
+  // 比较（会被跳过）；full 下 CMP 腿同样 weight=1，用实时价参与后续 sizing。
+  multiLegSizing?: 'split' | 'full';
+
   // Profit Taking Configuration
   fixedRiskRewardClose?: number | null; // Close position at fixed RR (e.g., 1.3 for 1.3R) if set. Null = explicitly disabled, undefined = use parser default.
   tpDistribution?: number[]; // Distribution of position to close at each target level (e.g., [0.8, 0.2]).

@@ -181,10 +181,18 @@ if (INSECURE_JWT_SECRETS.has(config.server.jwtSecret)) {
 }
 
 // 3. Export with computed properties
-export default {
+const exportedConfig = {
   ...config,
   trading: {
     ...config.trading,
+    // 运行时切换代理：面板 POST /api/config/trading-mode 直接写这里，
+    // 与 enableTrading 同源（内部 config.trading.mode），读写永远一致。
+    get mode(): string {
+      return config.trading.mode;
+    },
+    set mode(value: string) {
+      config.trading.mode = value;
+    },
     gate: {
       ...config.trading.gate,
       // Dynamic getter for active API Key based on mode
@@ -204,3 +212,5 @@ export default {
     return config.trading.mode === 'real' || config.trading.mode === 'testnet';
   }
 };
+
+export default exportedConfig;

@@ -27,6 +27,8 @@ import CfdLeg from './CfdLeg';
 import ExchangeConnectionLog from './ExchangeConnectionLog';
 import BacktestRun from './BacktestRun';
 import DiscordConfig from './DiscordConfig';
+import AIDelayQueue from './AIDelayQueue';
+import SignalAlert from './SignalAlert';
 
 // Define associations
 Strategy.hasMany(Order, { foreignKey: 'strategyId', as: 'Orders' });
@@ -80,6 +82,8 @@ export {
   ExchangeConnectionLog,
   BacktestRun,
   DiscordConfig,
+  AIDelayQueue,
+  SignalAlert,
 };
 
 export default sequelize;

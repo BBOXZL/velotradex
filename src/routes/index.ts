@@ -11,6 +11,7 @@ import marketService from '../services/MarketService';
 import orderQueryService from '../services/OrderQueryService';
 import config from '../config';
 import { authMiddleware } from '../middleware/auth';
+import { checkAdmin } from '../middleware/checkAdmin';
 import { auditMiddleware } from '../middleware/audit';
 import fs from 'fs';
 import path from 'path';
@@ -31,6 +32,7 @@ import virtualExchangeRoutes from './virtualExchange';
 import apiCredentialRoutes from './apiCredentials';
 import tradeRoutes from './trade';
 import discordConfigRoutes from './discordConfig';
+import signalAlertRoutes from './signalAlerts';
 // 历史回测功能暂时不可用，恢复时取消注释
 // import backtestRoutes from './backtest';
 import healthRoutes from './health';
@@ -157,6 +159,7 @@ router.use('/api/trades', tradeRoutes.routes(), tradeRoutes.allowedMethods());
 // 历史回测功能暂时不可用，恢复时取消注释
 // router.use('/api/backtest', backtestRoutes.routes(), backtestRoutes.allowedMethods());
 router.use('/api/api-credentials', apiCredentialRoutes.routes(), apiCredentialRoutes.allowedMethods());
+router.use('/api/signal-alerts', signalAlertRoutes.routes(), signalAlertRoutes.allowedMethods());
 router.use('/api/discord-config', discordConfigRoutes.routes(), discordConfigRoutes.allowedMethods());
 
 router.post('/api/auth/change-password', async (ctx) => {
@@ -195,6 +198,23 @@ router.get('/api/status', async (ctx) => {
 });
 
 router.get('/api/config/trading-mode', async (ctx) => {
+  ctx.body = {
+    mode: d.config.trading.mode,
+    enableTrading: d.config.enableTrading
+  };
+});
+
+// 面板"开始下单"总开关：运行时切换交易模式，立即对下单门控生效
+// （routeExecution 每次执行都读 config.enableTrading）。
+// 仅 admin 可调；非法值直接 400；重启后恢复为 .env 的 TRADING_MODE。
+router.post('/api/config/trading-mode', checkAdmin, async (ctx) => {
+  const { mode } = (ctx.request.body || {}) as any;
+  if (mode !== 'observe' && mode !== 'testnet' && mode !== 'real') {
+    ctx.status = 400;
+    ctx.body = { error: 'Invalid trading mode. Expected one of: observe, testnet, real' };
+    return;
+  }
+  d.config.trading.mode = mode;
   ctx.body = {
     mode: d.config.trading.mode,
     enableTrading: d.config.enableTrading

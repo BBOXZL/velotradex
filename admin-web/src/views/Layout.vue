@@ -130,6 +130,12 @@
         <div class="header-content">
           <span v-if="showPageTitle" class="page-title">{{ currentRouteName }}</span>
           <div class="user-info">
+             <!-- S8：全局拦截告警红点（与仪表盘同源，未读计数；点击回仪表盘处理） -->
+             <el-badge :value="alertUnread" :hidden="alertUnread === 0" :max="99" class="header-alert-badge">
+               <el-button link @click="goToDashboardAlerts" title="查看拦截告警">
+                 <el-icon :size="18"><Bell /></el-icon>
+               </el-button>
+             </el-badge>
              <el-dropdown @command="handleCommand">
                 <span class="el-dropdown-link" style="color: var(--text-color-primary); cursor: pointer; display: flex; align-items: center;">
                     {{ authStore.user?.username }}
@@ -175,10 +181,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, watch } from 'vue'
+import { ref, reactive, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useAuthStore } from '../stores/auth'
-import { useRoute } from 'vue-router'
-import { ArrowDown, Fold, Expand } from '@element-plus/icons-vue'
+import { useRoute, useRouter } from 'vue-router'
+import { ArrowDown, Fold, Expand, Bell } from '@element-plus/icons-vue'
 import {
   IconDashboard,
   IconChartLine,
@@ -204,6 +210,7 @@ import { ElMessage } from 'element-plus'
 
 const authStore = useAuthStore()
 const route = useRoute()
+const router = useRouter()
 const passwordDialogVisible = ref(false)
 const passwordSubmitting = ref(false)
 const passwordFormRef = ref(null)
@@ -307,6 +314,33 @@ const submitPasswordChange = async () => {
 const logout = () => {
   authStore.logout()
 }
+
+// S8：全局拦截告警红点（与仪表盘同源；点击回仪表盘处理）
+const alertUnread = ref(0)
+
+const fetchAlertUnread = async () => {
+  try {
+    const res = await request.get('/signal-alerts/unread-count')
+    alertUnread.value = Number(res.data?.unread) || 0
+  } catch {
+    // 静默失败：红点不阻塞主流程
+  }
+}
+
+const goToDashboardAlerts = () => {
+  if (route.path !== '/') router.push('/')
+}
+
+let alertTimer: any = null
+
+onMounted(() => {
+  fetchAlertUnread()
+  alertTimer = setInterval(fetchAlertUnread, 15000)
+})
+
+onUnmounted(() => {
+  if (alertTimer) clearInterval(alertTimer)
+})
 </script>
 
 <style scoped>
@@ -345,6 +379,13 @@ const logout = () => {
 }
 .user-info {
   display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* S8：顶栏告警红点 */
+.header-alert-badge {
+  display: inline-flex;
   align-items: center;
 }
 

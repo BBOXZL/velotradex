@@ -5,7 +5,7 @@
 import { IStrategyParser, ParsedStrategy, StrategyRiskConfig, DiscordMessage, GaulsAISignal } from './types';
 import logger, { formatError } from '../../utils/logger';
 import { parseRelaxedJson } from '../../utils/json';
-import aiParserService from '../AIParserService';
+import aiParserService, { isRetriableAIError } from '../AIParserService';
 import marketService from '../MarketService';
 
 export class GaulsParser implements IStrategyParser {
@@ -51,6 +51,7 @@ export class GaulsParser implements IStrategyParser {
       '### Symbol Extraction',
       '- Extract symbol from $SYMBOL notation, normalize to BASE_USDT format (e.g., $WIF -> WIF, output as "WIF")',
       '- If the message references a quoted/traded symbol for a close/update, set referencedSymbol',
+      '- For close/update: you MUST output both `symbol` and `referencedSymbol` with the same consistent value (e.g., both "WLD"). Never leave `symbol` empty when `referencedSymbol` is known.',
       '',
       '### Take Profit / Stop Loss',
       '- Extract multiple TPs if listed (TP1, TP2, etc.), put all in takeProfits array',
@@ -149,16 +150,22 @@ export class GaulsParser implements IStrategyParser {
     return { type: 'json_schema', json_schema: schema };
   }
 
-  public async postProcess(signal: GaulsAISignal): Promise<ParsedStrategy[] | null> {
+  public async postProcess(signal: GaulsAISignal, multiLegSizing?: 'split' | 'full'): Promise<ParsedStrategy[] | null> {
     if (signal.action === 'ignore') {
       logger.info('GaulsParser: AI classified as ignore', { reasoning: signal.reasoning });
       return null;
     }
 
-    const symbol = signal.symbol;
+    // S3: update/close 允许用 referencedSymbol 回填（ai_logs#27：BE 指令的
+    // symbol 为空、WLD 只在 referencedSymbol 里）。open 仍要求独立 symbol。
+    const isUpdateOrClose = signal.action === 'update' || signal.action === 'close';
+    const symbol = isUpdateOrClose ? (signal.symbol || signal.referencedSymbol) : signal.symbol;
     if (!symbol) {
       logger.warn('GaulsParser: No symbol in AI result');
       return null;
+    }
+    if (isUpdateOrClose && !signal.symbol && signal.referencedSymbol) {
+      logger.info('GaulsParser: update symbol backfilled from referencedSymbol', { referencedSymbol: signal.referencedSymbol });
     }
 
     const fullSymbol = symbol.includes('_') ? symbol : `${symbol}_USDT`;
@@ -269,7 +276,9 @@ export class GaulsParser implements IStrategyParser {
         logger.warn('GaulsParser: All entries filtered out (limit entries missing price)');
         return null;
       }
-      const weight = 1 / validEntries.length;
+      // S4: 默认 split 保持 weight=1/N 现状；full 时每腿 weight=1 全额
+      // （本函数是解析器直调路径；路由层逐条执行时由 applyMultiLegSizing 兜底）。
+      const weight = multiLegSizing === 'full' ? 1 : 1 / validEntries.length;
       // 组元数据：供路由级 entrySelection='nearest_sl' 判断哪个入场点距止损最近
       const groupEntries = validEntries.map((e) => ({ type: e.type, price: e.price }));
       return validEntries.map((entry, index) => ({
@@ -394,30 +403,72 @@ export class GaulsParser implements IStrategyParser {
     originalMessage: DiscordMessage;
     responseFormat: object;
   }): Promise<{ content: string; usage: any; raw: any; logId?: number } | null> {
-    // 第一次：strict json_schema
-    const first = await aiParserService.analyzeRaw({
-      systemPrompt: params.systemPrompt,
-      userContent: params.userContent,
-      originalMessage: params.originalMessage,
-      responseFormat: params.responseFormat,
-      timeout: 60000,
-    });
+    // S6: analyzeRaw already retries retriable upstream errors (5xx/timeout/
+    // empty) 3x with 0s/5s/30s backoff, so here we only handle two cases:
+    // (a) upstream throw that survived analyzeRaw's retries → delay path is
+    //     decided by the caller via delayContext; return null (no strategy).
+    // (b) 200-but-unparseable → keep the existing json_object downgrade.
+    const delayContext = {
+      messageId: String((params.originalMessage as any)?.id ?? ''),
+      channelId: String((params.originalMessage as any)?.channel_id ?? ''),
+      rawMessage: params.originalMessage,
+      routeIds: aiParserService.getCurrentRouteContext().routeIds,
+      routeNames: aiParserService.getCurrentRouteContext().routeNames,
+    };
+    let first: { content: string; usage: any; raw: any; logId?: number } | null = null;
+    try {
+      // 第一次：strict json_schema（analyzeRaw 内部已对可重试错误做 3 次退避）
+      first = await aiParserService.analyzeRaw({
+        systemPrompt: params.systemPrompt,
+        userContent: params.userContent,
+        originalMessage: params.originalMessage,
+        responseFormat: params.responseFormat,
+        timeout: 60000,
+        retryDelaysMs: process.env.NODE_ENV === 'test' ? [0, 0, 0] : undefined,
+        delayContext,
+      });
+    } catch (error: any) {
+      // Upstream still failing after analyzeRaw's own retries. Retriable
+      // exhaustion can still be saved by the json_object fallback below; only
+      // non-retriable (4xx) short-circuits here. The delay queue (wired via
+      // analyzeRaw's delayContext) holds the message for the worker.
+      if (!isRetriableAIError(error)) {
+        logger.error('GaulsParser: AI upstream non-retriable failure', formatError(error, {
+          messageId: delayContext.messageId, channelId: delayContext.channelId,
+        }));
+        return null;
+      }
+      logger.warn('GaulsParser: AI upstream attempts exhausted, trying json_object fallback', formatError(error, {
+        messageId: delayContext.messageId, channelId: delayContext.channelId,
+      }));
+      first = null;
+    }
     if (first && this.parseAIResponse(first.content)) {
       return first;
     }
 
     // 降级：json_object（不传 strict schema，由 prompt 约束输出）
     logger.warn('GaulsParser: strict json_schema response unparseable, retrying with json_object mode');
-    const fallback = await aiParserService.analyzeRaw({
-      systemPrompt: params.systemPrompt,
-      userContent: params.userContent,
-      originalMessage: params.originalMessage,
-      // 显式覆盖 extraPayload 中的 response_format 为 json_object，
-      // 确保 provider 端按宽松 JSON 约束输出
-      extraPayload: { response_format: { type: 'json_object' } },
-      timeout: 60000,
-    });
-    return fallback;
+    try {
+      const fallback = await aiParserService.analyzeRaw({
+        systemPrompt: params.systemPrompt,
+        userContent: params.userContent,
+        originalMessage: params.originalMessage,
+        // 显式覆盖 extraPayload 中的 response_format 为 json_object，
+        // 确保 provider 端按宽松 JSON 约束输出
+        extraPayload: { response_format: { type: 'json_object' } },
+        timeout: 60000,
+        retryDelaysMs: process.env.NODE_ENV === 'test' ? [0, 0, 0] : undefined,
+        delayContext,
+      });
+      return fallback;
+    } catch (error: any) {
+      logger.error('GaulsParser: AI fallback failed after retries', formatError(error, {
+        messageId: delayContext.messageId, channelId: delayContext.channelId,
+        retriable: isRetriableAIError(error),
+      }));
+      return null;
+    }
   }
 
   private parseAIResponse(content: string): GaulsAISignal | null {

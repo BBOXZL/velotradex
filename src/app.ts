@@ -11,6 +11,8 @@ import { initializeServices } from './serviceStartup';
 import { handleChannelMessage } from './channelMessageHandler';
 import systemStatusService from './services/SystemStatusService';
 import { discordGatewayManager } from './services/DiscordGatewayManager';
+import aiParserService from './services/AIParserService';
+import { AIDelayQueueService } from './services/AIDelayQueueService';
 
 const app = new Koa();
 app.proxy = true;
@@ -99,7 +101,12 @@ const start = async () => {
       // follow-up cannot overtake the opening signal while AI is still running.
       if (!config.backtest.child) {
         await discordGatewayManager.initialize(handleChannelMessage);
-        const stopDiscord = () => { void discordGatewayManager.stop(); };
+        // S6: delay-queue worker reposts to the same entrypoint with explicit
+        // routeIds/routeNames; start the per-minute ticker after init.
+        const aiDelayQueue = new AIDelayQueueService({ deliver: handleChannelMessage });
+        aiParserService.delayQueue = aiDelayQueue;
+        aiDelayQueue.start();
+        const stopDiscord = () => { void discordGatewayManager.stop(); aiDelayQueue.stop(); };
         process.once('SIGTERM', stopDiscord);
         process.once('SIGINT', stopDiscord);
       }

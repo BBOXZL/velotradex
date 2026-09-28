@@ -93,15 +93,15 @@ describe('Discord realtime ingestion', () => {
     await service.stop();
   });
 
-  test('stops later delivery on processing failure without an unhandled rejection', async () => {
+  test('isolates a processing failure so later delivery continues without an unhandled rejection', async () => {
     const { client, deliver, service } = setup();
     deliver.mockRejectedValueOnce(new Error('downstream unavailable'));
     await service.start();
     client.emit('raw', { t: 'MESSAGE_CREATE', d: original });
     client.emit('raw', { t: 'MESSAGE_CREATE', d: { ...original, id: '101' } });
     await service.drain();
-    expect(deliver).toHaveBeenCalledTimes(1);
-    expect(service.getStatus().state).toBe('failed');
+    expect(deliver).toHaveBeenCalledTimes(2);
+    expect(service.getStatus().state).not.toBe('failed');
     await service.stop();
   });
 

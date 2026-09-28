@@ -3,6 +3,12 @@
 //   'all'（默认）      : 全部入场点按 weight 均分仓位（现状行为，原样返回）；
 //   'nearest_sl'       : 仅在与止损价距离最近的入场点入场，该点全仓（weight=1），
 //                       其余入场点跳过（返回 filtered=true 由路由层过滤）。
+// 与 multiLegSizing（S4）的先后关系：先过滤、后分摊 —— 路由层先调
+// applyEntrySelection 做过滤，再对剩余腿调 applyMultiLegSizing 做分摊
+// （split 保持 weight=1/N，full 提为 weight=1）。
+// G4 CMP 腿说明：市价/CMP 入场点无价格，不参与"最近"比较（candidate=null，
+// 会被跳过）；Case A 里组内全 CMP 则无法判定、原样返回；Case B 里 entries[0]
+// 为市价时用 parsed.entryPrice（Kacang L1）参与比较。
 // 支持两种多入场点表达：
 //   A) 解析器拆分：每条 ParsedStrategy 携带 entryIndex/entryCount/groupEntries（Gauls/WWG）；
 //   B) 单条策略携带 entries 数组（KacangParser：L1 市价 + L2 限价）。

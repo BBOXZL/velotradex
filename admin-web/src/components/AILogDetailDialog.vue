@@ -8,16 +8,54 @@
   >
     <div v-if="log" class="log-detail">
       <div class="detail-actions">
+        <!-- S7: 勾选框升级为双按钮，默认仍是仅重解析（安全）。补单走二次确认。 -->
         <el-button
           type="warning"
           :loading="isRetrying(log?.id)"
-          @click="onRetry"
+          @click="onRetryOnly"
         >
-          重新解析
+          仅重解析
         </el-button>
-        <el-checkbox v-model="triggerOrder" label="同步触发订单" />
-        <span class="detail-tip">默认只重新解析，不触发下单。勾选后重新解析成功将走完整下单流程。</span>
+        <el-button
+          type="danger"
+          :loading="isRetrying(log?.id)"
+          @click="confirmVisible = true"
+        >
+          重解析并补下单
+        </el-button>
+        <span class="detail-tip">默认只重新解析，不触发下单。补下单需二次确认，且同一信号重复补单会被幂等拒绝。</span>
       </div>
+
+      <!-- S7: 二次确认框，回显 symbol/side/entry/SL/TP/路由 -->
+      <el-dialog
+        v-model="confirmVisible"
+        title="确认补下单"
+        width="min(560px, 90vw)"
+        append-to-body
+      >
+        <el-descriptions :column="2" border>
+          <el-descriptions-item label="交易对">{{ orderPreview.symbol }}</el-descriptions-item>
+          <el-descriptions-item label="方向">{{ orderPreview.side }}</el-descriptions-item>
+          <el-descriptions-item label="入场">{{ orderPreview.entry }}</el-descriptions-item>
+          <el-descriptions-item label="止损">{{ orderPreview.stopLoss }}</el-descriptions-item>
+          <el-descriptions-item label="止盈">{{ orderPreview.takeProfit }}</el-descriptions-item>
+          <el-descriptions-item label="路由">{{ orderPreview.route }}</el-descriptions-item>
+        </el-descriptions>
+        <p class="confirm-tip">
+          将先重解析该日志，解析成功后走完整下单流程并写 RETRY_TRIGGERED_ORDER 审计；
+          若该信号已有成功补单/已执行策略/关联订单，将被幂等拒绝且不会重复下单。
+        </p>
+        <template #footer>
+          <el-button @click="confirmVisible = false">取消</el-button>
+          <el-button
+            type="danger"
+            :loading="isRetrying(log?.id)"
+            @click="onConfirmRetryOrder"
+          >
+            确认补下单
+          </el-button>
+        </template>
+      </el-dialog>
 
       <div v-if="log.error" class="error-box">
         <strong>错误:</strong> {{ log.error }}
@@ -133,14 +171,14 @@ import {
   formatSummaryValue,
   getResponseSummarySource
 } from '../utils/aiLog'
-import { isRetrying } from '../composables/useAiLogRetry'
+import { isRetrying, extractRetryOrderPreview } from '../composables/useAiLogRetry'
 import { formatDate, formatTokenCount, formatDurationSec } from '../utils/format'
 
 const visible = defineModel<boolean>({ required: true })
 const props = defineProps<{ log: any }>()
 const emit = defineEmits<{ retry: [triggerOrder: boolean] }>()
 
-const triggerOrder = ref(false)
+const confirmVisible = ref(false)
 const responseViewStorageKey = 'ai-log-response-view-mode'
 const savedResponseViewMode = localStorage.getItem(responseViewStorageKey)
 const responseViewMode = ref(savedResponseViewMode === 'summary' ? 'summary' : 'raw')
@@ -189,17 +227,37 @@ watch(responseViewMode, (mode) => {
   localStorage.setItem(responseViewStorageKey, mode)
 })
 
-// 每次打开/刷新日志时，重置折叠面板与「同步触发订单」勾选，等价于原 retryLog/viewLogDetail 中的重置逻辑。
+// 每次打开/刷新日志时，重置折叠面板与补单确认框。
 watch(
   () => props.log,
   () => {
     promptCollapseActive.value = []
-    triggerOrder.value = false
+    confirmVisible.value = false
   }
 )
 
-const onRetry = () => {
-  emit('retry', triggerOrder.value)
+// S7: 二次确认框回显（symbol/side/entry/SL/TP/路由），取自当前日志 response。
+const orderPreview = computed(() => {
+  const preview = extractRetryOrderPreview(props.log)
+  return (
+    preview ?? {
+      symbol: '-',
+      side: '-',
+      entry: '-',
+      stopLoss: '-',
+      takeProfit: '-',
+      route: formatRouteNames(props.log),
+    }
+  )
+})
+
+const onRetryOnly = () => {
+  emit('retry', false)
+}
+
+const onConfirmRetryOrder = () => {
+  confirmVisible.value = false
+  emit('retry', true)
 }
 </script>
 
@@ -306,6 +364,12 @@ const onRetry = () => {
 .detail-tip {
     font-size: 12px;
     color: #909399;
+}
+.confirm-tip {
+    margin: 12px 0 0;
+    font-size: 12px;
+    color: #909399;
+    line-height: 1.6;
 }
 .error-box {
     color: #f56c6c;

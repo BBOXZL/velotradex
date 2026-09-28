@@ -3,6 +3,11 @@
     <el-card class="config-card">
       <div class="logs-header">
         <div class="logs-filters">
+          <!-- S8 信号收件箱：“已忽略”页签复用 ai_logs（action=ignored），不污染 strategies 状态机 -->
+          <el-tabs v-model="inboxTab" @tab-change="handleInboxTabChange" style="--el-tabs-header-height: 32px;">
+            <el-tab-pane label="全部" name="all" />
+            <el-tab-pane label="已忽略" name="ignored" />
+          </el-tabs>
           <el-select
             v-model="filterRouteId"
             placeholder="信号路由"
@@ -63,7 +68,13 @@
               {{ getResponseAction(scope.row) }}
             </template>
           </el-table-column>
-          <el-table-column label="操作" width="170" fixed="right">
+          <!-- S8：已忽略页签下 reasoning 可见 -->
+          <el-table-column v-if="inboxTab === 'ignored'" label="忽略原因" min-width="220" show-overflow-tooltip>
+            <template #default="scope">
+              {{ getResponseReasoning(scope.row) }}
+            </template>
+          </el-table-column>
+          <el-table-column label="操作" width="220" fixed="right">
             <template #default="scope">
               <el-button
                 v-if="scope.row.status === 'error'"
@@ -73,6 +84,16 @@
                 @click="onTableRetry(scope.row)"
               >
                 重试
+              </el-button>
+              <!-- S8：已忽略行可逐条“改判并补单”，复用 S7 triggerOrder（含幂等 guard） -->
+              <el-button
+                v-if="inboxTab === 'ignored'"
+                size="small"
+                type="danger"
+                :loading="isRetrying(scope.row.id)"
+                @click="onOverrideRetry(scope.row)"
+              >
+                改判并补单
               </el-button>
               <el-button size="small" @click="viewLogDetail(scope.row)">详情</el-button>
             </template>
@@ -108,7 +129,7 @@ import { ref, onMounted } from 'vue'
 import request from '../utils/request'
 import { ElMessage } from 'element-plus'
 import { Refresh, Setting } from '@element-plus/icons-vue'
-import { formatRouteNames, getResponseAction } from '../utils/aiLog'
+import { formatRouteNames, getResponseAction, getResponseReasoning } from '../utils/aiLog'
 import { useAiLogRetry } from '../composables/useAiLogRetry'
 import AIConfigFormDialog from '../components/AIConfigFormDialog.vue'
 import AILogDetailDialog from '../components/AILogDetailDialog.vue'
@@ -127,6 +148,8 @@ const logsPage = ref(1)
 const logsLimit = ref(20)
 const signalRoutes = ref<any[]>([])
 const filterRouteId = ref('')
+// S8 信号收件箱页签：all | ignored
+const inboxTab = ref('all')
 
 const fetchLogs = async () => {
   logsLoading.value = true
@@ -135,7 +158,8 @@ const fetchLogs = async () => {
       params: {
         page: logsPage.value,
         limit: logsLimit.value,
-        ...(filterRouteId.value ? { routeId: filterRouteId.value } : {})
+        ...(filterRouteId.value ? { routeId: filterRouteId.value } : {}),
+        ...(inboxTab.value === 'ignored' ? { action: 'ignored' } : {})
       }
     })
     logs.value = res.data.logs
@@ -161,6 +185,11 @@ const handleLogFilterChange = () => {
   fetchLogs()
 }
 
+const handleInboxTabChange = () => {
+  logsPage.value = 1
+  fetchLogs()
+}
+
 const viewLogDetail = async (log: any) => {
   // 先展示部分数据，再异步拉取完整日志（含图片等详情）
   currentLog.value = log
@@ -182,6 +211,16 @@ const { isRetrying, retryLog } = useAiLogRetry(fetchLogs)
 const onTableRetry = async (row: any) => {
   const res = await retryLog(row)
   // 重试成功且返回新日志时，打开详情弹窗展示解析结果
+  if (res?.log) {
+    currentLog.value = res.log
+    logDialogVisible.value = true
+  }
+}
+
+// S8：已忽略行的“改判并补单”——复用 S7 triggerOrder=true（含幂等 guard + 审计）。
+// 点一次走通 S7：成功则弹窗展示新日志 + 订单提示由 useAiLogRetry 统一给出。
+const onOverrideRetry = async (row: any) => {
+  const res = await retryLog(row, true)
   if (res?.log) {
     currentLog.value = res.log
     logDialogVisible.value = true
